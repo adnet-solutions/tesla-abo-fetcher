@@ -12,6 +12,11 @@ Befehle:
   list                  Verfügbare Rechnungen anzeigen (mit Status)
   run                   Neue Rechnungen verarbeiten (Standard)
 
+Wartung:
+  --version             installierte Version anzeigen
+  --check-update        auf GitHub nach neuer Version schauen
+  --update [--force]    neue Version von GitHub installieren
+
 Wichtige Optionen für list/run:
   --month 2026-09       nur dieser Monat
   --year 2026           nur dieses Jahr
@@ -32,8 +37,10 @@ import json
 import os
 import re
 import secrets
+import shutil
 import smtplib
 import ssl
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -43,7 +50,8 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+DEFAULT_REPO = "adnet-solutions/tesla-abo-fetcher"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 OWNERAPI_CLIENT_ID = "ownerapi"
@@ -556,12 +564,145 @@ def cmd_run(cfg, state, tesla, args):
     return 1 if errors else 0
 
 
+# --------------------------------------------------------------------------
+# Updates aus GitHub
+# --------------------------------------------------------------------------
+
+# Dateien, die ein Update ersetzt. config.ini, state.json und Rechnungen
+# werden nie angefasst.
+UPDATE_FILES = ["tesla_pc_invoices.py", "config.example.ini", "README.md", "CHANGELOG.md"]
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3])
+
+
+class Updater:
+    def __init__(self, cfg=None):
+        get = (lambda k, d: cfg.get("update", k, d)) if cfg else (lambda k, d: d)
+        self.repo = get("repo", DEFAULT_REPO)
+        self.branch = get("branch", "main")
+        self.token = get("github_token", "") or os.environ.get("GITHUB_TOKEN", "")
+        self.api = os.environ.get("TPI_GITHUB_API", "https://api.github.com").rstrip("/")
+
+    def fetch(self, path):
+        url = (f"{self.api}/repos/{self.repo}/contents/{urllib.parse.quote(path)}"
+               f"?ref={urllib.parse.quote(self.branch)}")
+        hdrs = {"Accept": "application/vnd.github.raw", "User-Agent": f"tesla-abo-fetcher/{VERSION}"}
+        if self.token:
+            hdrs["Authorization"] = f"Bearer {self.token}"
+        try:
+            return http("GET", url, headers=hdrs, expect="bytes")
+        except HttpError as e:
+            if e.code == 404:
+                raise FileNotFoundError(path) from None
+            if e.code in (401, 403):
+                raise Fail(f"GitHub verweigert den Zugriff (HTTP {e.code}). Bei privatem Repo oder "
+                           f"Rate-Limit in config.ini unter [update] github_token setzen.") from None
+            raise
+
+    def remote(self):
+        try:
+            script = self.fetch("tesla_pc_invoices.py")
+        except FileNotFoundError:
+            raise Fail(f"Skript im Repo {self.repo} (Branch {self.branch}) nicht gefunden. "
+                       f"Bei privatem Repo [update] github_token setzen.") from None
+        m = re.search(r'^VERSION\s*=\s*"([^"]+)"', script.decode("utf-8", "replace"), re.M)
+        if not m:
+            raise Fail("Im Skript auf GitHub ist keine VERSION zu finden.")
+        return m[1], script
+
+    def changes_since(self, local_version):
+        """Einträge aus CHANGELOG.md, die neuer sind als die lokale Version."""
+        try:
+            text = self.fetch("CHANGELOG.md").decode("utf-8", "replace")
+        except FileNotFoundError:
+            return []
+        out, cur = [], None
+        for line in text.splitlines():
+            m = re.match(r"^##\s*\[?v?(\d+\.\d+\.\d+)\]?(.*)$", line)
+            if m:
+                cur = None
+                if version_tuple(m[1]) > version_tuple(local_version):
+                    cur = [f"{m[1]}{m[2]}".strip()]
+                    out.append(cur)
+            elif cur is not None and line.strip():
+                cur.append(line.rstrip())
+        return out
+
+
+def cmd_check_update(upd):
+    remote_version, _ = upd.remote()
+    log(f"Installiert: {VERSION}")
+    log(f"Auf GitHub:  {remote_version}  ({upd.repo}, Branch {upd.branch})")
+    if version_tuple(remote_version) <= version_tuple(VERSION):
+        log("Du bist auf dem aktuellen Stand.")
+        return 0
+    log(f"\nUpdate verfügbar: {VERSION} -> {remote_version}")
+    for entry in upd.changes_since(VERSION):
+        log(f"\n  {entry[0]}")
+        for line in entry[1:]:
+            log(f"    {line}")
+    log("\nInstallieren mit: python3 tesla_pc_invoices.py --update")
+    return 3
+
+
+def cmd_update(upd, force=False):
+    remote_version, script = upd.remote()
+    newer = version_tuple(remote_version) > version_tuple(VERSION)
+    if not newer and not force:
+        log(f"Bereits aktuell ({VERSION}). Mit --force trotzdem neu installieren.")
+        return 0
+
+    # 1) Git-Checkout: einfach pullen
+    if (SCRIPT_DIR / ".git").exists() and shutil.which("git"):
+        log(f"Git-Checkout erkannt, hole {upd.branch} ...")
+        res = subprocess.run(["git", "-C", str(SCRIPT_DIR), "pull", "--ff-only", "origin", upd.branch],
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            raise Fail("git pull fehlgeschlagen (lokale Änderungen?):\n" + (res.stderr or res.stdout).strip())
+        log(res.stdout.strip() or "ok")
+        log(f"Update fertig: {VERSION} -> {remote_version}")
+        return 0
+
+    # 2) Kopie ohne Git (z. B. Home Assistant): Dateien direkt laden
+    try:
+        compile(script, "tesla_pc_invoices.py", "exec")
+    except SyntaxError as e:
+        raise Fail(f"Heruntergeladenes Skript ist fehlerhaft, Update abgebrochen: {e}") from None
+    files = {"tesla_pc_invoices.py": script}
+    for name in UPDATE_FILES[1:]:
+        try:
+            files[name] = upd.fetch(name)
+        except FileNotFoundError:
+            debug(f"{name} nicht im Repo, übersprungen")
+    own = SCRIPT_DIR / "tesla_pc_invoices.py"
+    backup = own.with_name(f"tesla_pc_invoices.py.{VERSION}.bak")
+    shutil.copy2(own, backup)
+    for name, data in files.items():
+        mode = 0o755 if name.endswith(".py") else 0o644
+        atomic_write(SCRIPT_DIR / name, data, mode=mode)
+        log(f"  aktualisiert: {name}")
+    log(f"Update fertig: {VERSION} -> {remote_version} (Sicherung: {backup.name})")
+    for entry in upd.changes_since(VERSION):
+        log(f"  {entry[0]}")
+        for line in entry[1:]:
+            log(f"    {line}")
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Tesla Premium-Connectivity-Rechnungen abholen und an GetMyInvoices weitergeben.")
     p.add_argument("-c", "--config", default=str(SCRIPT_DIR / "config.ini"), help="Pfad zur config.ini")
     p.add_argument("--debug", action="store_true", help="ausführliche Ausgabe")
-    p.add_argument("--version", action="version", version=VERSION)
+    p.add_argument("-v", "--version", "-version", action="version", version=f"tesla-abo-fetcher {VERSION}",
+                   help="installierte Version anzeigen")
+    p.add_argument("--check-update", "--checkupdate", "-checkupdate", dest="check_update", action="store_true",
+                   help="auf GitHub nach neuer Version schauen (Exit-Code 3 = Update verfügbar)")
+    p.add_argument("--update", "-update", dest="update", action="store_true",
+                   help="neue Version von GitHub installieren")
+    p.add_argument("--force", action="store_true", help="mit --update: auch ohne neue Version neu installieren")
     sub = p.add_subparsers(dest="cmd")
 
     sub.add_parser("login", help="einmalig bei Tesla anmelden")
@@ -597,6 +738,16 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     DEBUG = args.debug
+    if args.check_update or args.update:
+        try:
+            cfg = None
+            if Path(args.config).exists():
+                cfg = Config(args.config)
+            upd = Updater(cfg)
+            return cmd_update(upd, args.force) if args.update else cmd_check_update(upd)
+        except Fail as e:
+            log(f"FEHLER: {e}")
+            return 2
     if not args.cmd:
         args = parser.parse_args((argv or sys.argv[1:]) + ["run"])
         DEBUG = args.debug

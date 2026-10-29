@@ -16,7 +16,8 @@ Nur Python 3.8+ Standardbibliothek, keine Pakete nötig.
 |---|---|
 | `tesla_pc_invoices.py` | das Skript |
 | `config.example.ini` | Vorlage für `config.ini` |
-| `tests/run_tests.py` | End-to-End-Test gegen nachgebaute Tesla-/GMI-/SMTP-Server (`python3 tests/run_tests.py`) |
+| `CHANGELOG.md` | Änderungen je Version |
+| `tests/run_tests.py` | End-to-End-Test gegen nachgebaute Tesla-/GMI-/SMTP-/GitHub-Server (`python3 tests/run_tests.py`) |
 
 `config.ini`, `state.json` (Tesla-Token!) und der Rechnungsordner stehen in `.gitignore`
 und gehören nicht ins Repo.
@@ -114,6 +115,38 @@ mode: single
 
 `notify.notify` ggf. durch deinen Handy-Dienst ersetzen (z. B. `notify.mobile_app_...`).
 Bei Exit-Code 2 mit „neu anmelden" einfach `login` erneut ausführen.
+
+## Version und Updates
+
+```bash
+python3 tesla_pc_invoices.py --version        # installierte Version
+python3 tesla_pc_invoices.py --check-update   # gibt's was Neues? zeigt Version + Änderungen
+python3 tesla_pc_invoices.py --update         # neue Version installieren
+python3 tesla_pc_invoices.py --update --force # aktuelle Version neu installieren
+```
+
+Die Kurzformen `-version`, `-checkupdate` und `-update` gehen auch.
+
+- **Mit Git geklont** (Linux-Server): `--update` macht ein `git pull --ff-only`.
+- **Ohne Git kopiert** (z. B. Home Assistant): `--update` lädt Skript, README, CHANGELOG und
+  `config.example.ini` direkt von GitHub. Das alte Skript bleibt als
+  `tesla_pc_invoices.py.<version>.bak` liegen. Ein fehlerhaft heruntergeladenes Skript wird
+  nicht installiert.
+- `config.ini`, `state.json` und die Rechnungen werden nie angefasst.
+- Neue Einstellungen stehen nach einem Update in `config.example.ini` – bei Bedarf in die
+  eigene `config.ini` übernehmen.
+
+`--check-update` endet mit Exit-Code `3`, wenn ein Update da ist. Damit kann Home Assistant
+Bescheid geben, z. B. wöchentlich:
+
+```yaml
+shell_command:
+  tesla_abo_check_update: "python3 /config/tesla-abo-fetcher/tesla_pc_invoices.py -c /config/tesla-abo-fetcher/config.ini --check-update"
+```
+
+Die Automation dazu wie oben, nur mit `result.returncode == 3` als Bedingung.
+
+Änderungen je Version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Fehlersuche
 

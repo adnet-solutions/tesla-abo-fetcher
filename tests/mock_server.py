@@ -1,4 +1,4 @@
-import json, threading, socketserver, sys, base64
+import json, urllib.parse, threading, socketserver, sys, base64
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 LOG = []
@@ -9,6 +9,7 @@ INVOICES = [
     {"InvoiceId": "dddd4444-0000", "InvoiceDate": "2025-12-14", "Amount": 9.99},
 ]
 TOKENS = {"n": 0}
+REMOTE_FILES = {}  # Pfad -> bytes, simuliert GitHub-Repo
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -32,6 +33,12 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {"documentUid": f"doc-{len(LOG)}"})
         self._send(404, {})
     def do_GET(self):
+        if self.path.startswith("/repos/"):
+            path = urllib.parse.unquote(self.path.split("/contents/", 1)[1].split("?")[0])
+            LOG.append(("github", path))
+            if path in REMOTE_FILES:
+                return self._send(200, REMOTE_FILES[path], "application/octet-stream")
+            return self._send(404, {"message": "Not Found"})
         assert self.headers["Authorization"].startswith("Bearer AT")
         if self.path.startswith("/mobile-app/subscriptions/invoices"):
             assert "optionCode=%24CPF1" in self.path and "vin=TESTVIN" in self.path

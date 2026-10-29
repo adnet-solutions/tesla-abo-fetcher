@@ -1,4 +1,4 @@
-import os, sys, json, shutil, io, contextlib, tempfile
+import os, re, sys, json, shutil, io, contextlib, tempfile
 from pathlib import Path
 os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1,localhost"
 SP = Path(__file__).resolve().parent
@@ -44,3 +44,43 @@ rc, o = run("run", "--month", "2026-13"); assert rc == 2
 st = json.loads((work / "state.json").read_text()); st["tokens"] = {"refresh_token": "bad"}; (work / "state.json").write_text(json.dumps(st))
 rc, o = run("run"); assert rc == 2 and "neu anmelden" in o
 print("ALLE TESTS OK")
+
+# ---------------- Update-Funktion ----------------
+import subprocess
+env = dict(os.environ, TPI_GITHUB_API=f"http://127.0.0.1:{http_port}")
+inst = Path(tempfile.mkdtemp(prefix="tpi-upd-"))            # Installation ohne Git (wie in HA)
+for f in ("tesla_pc_invoices.py", "config.example.ini"):
+    shutil.copy(ROOT / f, inst / f)
+(inst / "config.ini").write_text("[tesla]\nvin = X\n")       # muss erhalten bleiben
+(inst / "state.json").write_text('{"tokens": {"refresh_token": "keep"}}')
+
+def cli(*a):
+    r = subprocess.run([sys.executable, str(inst / "tesla_pc_invoices.py"), *a], capture_output=True, text=True, env=env)
+    print(f"$ {' '.join(a)}  -> rc={r.returncode}\n{r.stdout}{r.stderr}")
+    return r.returncode, r.stdout
+
+local = (ROOT / "tesla_pc_invoices.py").read_text()
+cur = re.search(r'^VERSION = "([^"]+)"', local, re.M)[1]
+rc, o = cli("--version"); assert cur in o
+mock_server.REMOTE_FILES["tesla_pc_invoices.py"] = local.encode()
+rc, o = cli("--check-update"); assert rc == 0 and "aktuellen Stand" in o
+rc, o = cli("--update"); assert rc == 0 and "Bereits aktuell" in o
+
+newer = "99.0.0"
+mock_server.REMOTE_FILES["tesla_pc_invoices.py"] = local.replace(f'VERSION = "{cur}"', f'VERSION = "{newer}"').encode()
+mock_server.REMOTE_FILES["README.md"] = b"# neu\n"
+mock_server.REMOTE_FILES["CHANGELOG.md"] = (f"# Changelog\n\n## [{newer}] - 2099-01-01\n- Tolles Feature\n\n## [{cur}] - alt\n- alt\n").encode()
+rc, o = cli("-checkupdate"); assert rc == 3 and newer in o and "Tolles Feature" in o and "- alt" not in o
+rc, o = cli("-update"); assert rc == 0 and "Update fertig" in o
+rc, o = cli("--version"); assert newer in o
+assert (inst / "README.md").read_text() == "# neu\n"
+assert (inst / f"tesla_pc_invoices.py.{cur}.bak").exists()
+assert (inst / "config.ini").read_text() == "[tesla]\nvin = X\n" and "keep" in (inst / "state.json").read_text()
+assert os.access(inst / "tesla_pc_invoices.py", os.X_OK)
+
+mock_server.REMOTE_FILES["tesla_pc_invoices.py"] = b'VERSION = "100.0.0"\ndef kaputt(:\n'
+rc, o = cli("--update"); assert rc == 2 and "fehlerhaft" in o
+rc, o = cli("--version"); assert newer in o                 # kaputtes Update nicht installiert
+mock_server.REMOTE_FILES.clear()
+rc, o = cli("--check-update"); assert rc == 2 and "nicht gefunden" in o
+print("UPDATE-TESTS OK")
