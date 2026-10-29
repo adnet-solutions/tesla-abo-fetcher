@@ -16,6 +16,8 @@ Wartung:
   --version             installierte Version anzeigen
   --check-update        auf GitHub nach neuer Version schauen
   --update [--force]    neue Version von GitHub installieren
+  --notify-test         Testnachricht an HA / Pushover / WhatsApp
+  --no-notify           für diesen Lauf keine Benachrichtigungen
 
 Wichtige Optionen für list/run:
   --month 2026-09       nur dieser Monat
@@ -50,7 +52,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_REPO = "adnet-solutions/tesla-abo-fetcher"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -82,7 +84,7 @@ def debug(msg):
         print(f"[debug] {msg}", flush=True)
 
 
-def http(method, url, *, headers=None, json_body=None, form=None, expect="json", timeout=60):
+def http(method, url, *, headers=None, json_body=None, form=None, expect="json", timeout=60, ssl_context=None):
     data = None
     hdrs = {"Accept": "application/json" if expect == "json" else "*/*"}
     hdrs.update(headers or {})
@@ -95,7 +97,7 @@ def http(method, url, *, headers=None, json_body=None, form=None, expect="json",
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     debug(f"{method} {url.split('?')[0]}")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:
             body = resp.read()
             status = resp.status
     except urllib.error.HTTPError as e:
@@ -515,7 +517,7 @@ def cmd_list(cfg, state, tesla, args):
     return 0
 
 
-def cmd_run(cfg, state, tesla, args):
+def cmd_run(cfg, state, tesla, args, notifier=None):
     targets = active_targets(cfg, args)
     invs = filter_invoices(tesla.invoices(), args)
     log(f"{len(invs)} Rechnung(en) im Zeitraum, Ziele: {', '.join(targets)}"
@@ -523,6 +525,7 @@ def cmd_run(cfg, state, tesla, args):
 
     errors = 0
     processed = 0
+    done_lines, error_lines = [], []
     for inv in invs:
         todo = [t for t in targets if args.reload or not state.done(inv["id"], t)]
         if not todo:
@@ -555,13 +558,137 @@ def cmd_run(cfg, state, tesla, args):
                     log(f"  an GMI (Mail): {label}")
                 state.save()  # nach jedem Ziel sichern, damit nichts doppelt geht
             processed += 1
+            done_lines.append(f"{fmt_date(inv['date'])}: {fmt_amount(inv)} -> {', '.join(TARGET_LABELS[t] for t in todo)}")
         except (Fail, smtplib.SMTPException, OSError) as e:
             errors += 1
             log(f"  FEHLER bei {label}: {e}")
+            error_lines.append(f"{fmt_date(inv['date'])}: {e}")
 
     if not args.dry_run:
         log(f"Fertig: {processed} verarbeitet, {errors} Fehler.")
+    if notifier and not args.dry_run and not args.mark_only:
+        if processed:
+            n = "1 neue Rechnung" if processed == 1 else f"{processed} neue Rechnungen"
+            notifier.send("new", f"Tesla: {n}", "\n".join(done_lines))
+        if errors:
+            notifier.send("error", "Tesla-Rechnungen: Fehler",
+                          f"{errors} Rechnung(en) nicht verarbeitet:\n" + "\n".join(error_lines)[:900],
+                          important=True)
     return 1 if errors else 0
+
+
+TARGET_LABELS = {"local": "lokal", "gmi_api": "GMI", "gmi_mail": "GMI (Mail)"}
+
+
+def fmt_date(d):
+    return d.strftime("%d.%m.%Y") if d else "?"
+
+
+def fmt_amount(inv):
+    if inv.get("amount") in (None, ""):
+        return "Betrag siehe PDF"
+    try:
+        return f"{float(inv['amount']):.2f}".replace(".", ",") + f" {inv['currency']}"
+    except (TypeError, ValueError):
+        return f"{inv['amount']} {inv['currency']}"
+
+
+# --------------------------------------------------------------------------
+# Benachrichtigungen: Home Assistant, Pushover, WhatsApp (CallMeBot)
+# --------------------------------------------------------------------------
+
+NOTIFY_CHANNELS = ("ha", "pushover", "whatsapp")
+NOTIFY_EVENTS = ("new", "error", "update")
+
+
+class Notifier:
+    def __init__(self, cfg, enabled=True):
+        self.cfg = cfg
+        raw = cfg.get("notify", "channels", "") if cfg else ""
+        self.channels = [c.strip().lower() for c in raw.split(",") if c.strip()]
+        for c in self.channels:
+            if c not in NOTIFY_CHANNELS:
+                raise Fail(f"Unbekannter Benachrichtigungskanal {c!r} (erlaubt: {', '.join(NOTIFY_CHANNELS)})")
+        ev = cfg.get("notify", "events", "new, error, update") if cfg else ""
+        self.events = {e.strip().lower() for e in ev.split(",") if e.strip()}
+        self.enabled = enabled
+
+    def send(self, event, title, message, important=False, force=False):
+        """Schickt an alle Kanäle. Fehler beim Senden brechen nie den Lauf ab."""
+        if not self.channels or not (force or (self.enabled and event in self.events)):
+            return 0
+        ok = 0
+        for ch in self.channels:
+            try:
+                getattr(self, f"_{ch}")(title, message, important)
+                debug(f"Benachrichtigung über {ch} gesendet")
+                ok += 1
+            except Exception as e:  # noqa: BLE001 – Benachrichtigung darf nie stören
+                log(f"  Benachrichtigung über {ch} fehlgeschlagen: {e}")
+        return ok
+
+    def _ha(self, title, message, important):
+        c = self.cfg
+        base = c.get("notify_ha", "url").rstrip("/")
+        if not base:
+            raise Fail("[notify_ha] url fehlt")
+        ctx = None
+        if not c.bool("notify_ha", "verify_ssl", True):
+            ctx = ssl._create_unverified_context()
+        webhook = c.get("notify_ha", "webhook_id")
+        if webhook:
+            http("POST", f"{base}/api/webhook/{urllib.parse.quote(webhook)}", expect="bytes", ssl_context=ctx,
+                 json_body={"title": title, "message": message, "important": important,
+                            "source": "tesla-abo-fetcher"})
+            return
+        token, service = c.get("notify_ha", "token"), c.get("notify_ha", "service")
+        if not token or not service:
+            raise Fail("[notify_ha] braucht token + service oder webhook_id")
+        domain, _, name = service.partition(".")
+        if not name:
+            domain, name = "notify", service
+        body = {"title": title, "message": message}
+        if important and name.startswith("mobile_app_"):
+            body["data"] = {"push": {"interruption-level": "time-sensitive"}}  # iOS: durchstellen
+        http("POST", f"{base}/api/services/{domain}/{name}", json_body=body, ssl_context=ctx,
+             headers={"Authorization": f"Bearer {token}"})
+
+    def _pushover(self, title, message, important):
+        c = self.cfg
+        token, user = c.get("notify_pushover", "app_token"), c.get("notify_pushover", "user_key")
+        if not token or not user:
+            raise Fail("[notify_pushover] app_token und user_key fehlen")
+        form = {"token": token, "user": user, "title": title, "message": message,
+                "priority": c.get("notify_pushover", "priority_error" if important else "priority", "1" if important else "0")}
+        if c.get("notify_pushover", "device"):
+            form["device"] = c.get("notify_pushover", "device")
+        url = c.get("notify_pushover", "api_url", "https://api.pushover.net/1/messages.json")
+        res = http("POST", url, form=form)
+        if not isinstance(res, dict) or res.get("status") != 1:
+            raise Fail(f"Pushover meldet: {res}")
+
+    def _whatsapp(self, title, message, important):
+        c = self.cfg
+        phone, key = c.get("notify_whatsapp", "phone"), c.get("notify_whatsapp", "apikey")
+        if not phone or not key:
+            raise Fail("[notify_whatsapp] phone und apikey fehlen")
+        text = f"*{title}*\n{message}"
+        url = c.get("notify_whatsapp", "api_url", "https://api.callmebot.com/whatsapp.php")
+        q = urllib.parse.urlencode({"phone": phone, "text": text, "apikey": key})
+        body = http("GET", f"{url}?{q}", expect="bytes").decode("utf-8", "replace")
+        debug(f"CallMeBot: {body[:300]}")
+        if re.search(r"(?i)apikey is invalid|invalid apikey|not activated", body):
+            raise Fail("CallMeBot lehnt ab – API-Key/Telefonnummer prüfen")
+
+
+def notify_test(notifier):
+    if not notifier.channels:
+        log("Keine Benachrichtigungskanäle in config.ini ([notify] channels) eingetragen.")
+        return 2
+    n = notifier.send("test", "Tesla-Rechnungen: Test",
+                      f"Testnachricht von tesla-abo-fetcher {VERSION}. Wenn du das liest, passt alles.", force=True)
+    log(f"Test an {n} von {len(notifier.channels)} Kanal/Kanälen erfolgreich gesendet.")
+    return 0 if n == len(notifier.channels) else 1
 
 
 # --------------------------------------------------------------------------
@@ -631,7 +758,7 @@ class Updater:
         return out
 
 
-def cmd_check_update(upd):
+def cmd_check_update(upd, notifier=None):
     remote_version, _ = upd.remote()
     log(f"Installiert: {VERSION}")
     log(f"Auf GitHub:  {remote_version}  ({upd.repo}, Branch {upd.branch})")
@@ -639,10 +766,16 @@ def cmd_check_update(upd):
         log("Du bist auf dem aktuellen Stand.")
         return 0
     log(f"\nUpdate verfügbar: {VERSION} -> {remote_version}")
-    for entry in upd.changes_since(VERSION):
+    changes = upd.changes_since(VERSION)
+    for entry in changes:
         log(f"\n  {entry[0]}")
         for line in entry[1:]:
             log(f"    {line}")
+    if notifier:
+        details = "\n".join(l.strip() for e in changes for l in e[1:])[:700]
+        notifier.send("update", f"Tesla-Rechnungen: Update {remote_version}",
+                      f"Installiert: {VERSION}, neu: {remote_version}\n{details}\n"
+                      f"Installieren mit --update")
     log("\nInstallieren mit: python3 tesla_pc_invoices.py --update")
     return 3
 
@@ -703,6 +836,10 @@ def build_parser():
     p.add_argument("--update", "-update", dest="update", action="store_true",
                    help="neue Version von GitHub installieren")
     p.add_argument("--force", action="store_true", help="mit --update: auch ohne neue Version neu installieren")
+    p.add_argument("--notify-test", "-notifytest", dest="notify_test", action="store_true",
+                   help="Testnachricht an alle eingerichteten Kanäle schicken")
+    p.add_argument("--no-notify", dest="no_notify", action="store_true",
+                   help="für diesen Lauf keine Benachrichtigungen")
     sub = p.add_subparsers(dest="cmd")
 
     sub.add_parser("login", help="einmalig bei Tesla anmelden")
@@ -730,6 +867,8 @@ def build_parser():
     rn.add_argument("--mark-only", action="store_true",
                     help="nichts herunterladen/senden, nur als erledigt markieren")
     rn.add_argument("--dry-run", action="store_true", help="nur anzeigen, nichts tun")
+    rn.add_argument("--no-notify", dest="no_notify", action="store_true", default=argparse.SUPPRESS,
+                    help="für diesen Lauf keine Benachrichtigungen")
     return p
 
 
@@ -738,13 +877,18 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     DEBUG = args.debug
-    if args.check_update or args.update:
+    if args.check_update or args.update or args.notify_test:
         try:
             cfg = None
             if Path(args.config).exists():
                 cfg = Config(args.config)
+            notifier = Notifier(cfg, enabled=not args.no_notify)
+            if args.notify_test:
+                if not cfg:
+                    raise Fail(f"Konfiguration nicht gefunden: {args.config}")
+                return notify_test(notifier)
             upd = Updater(cfg)
-            return cmd_update(upd, args.force) if args.update else cmd_check_update(upd)
+            return cmd_update(upd, args.force) if args.update else cmd_check_update(upd, notifier)
         except Fail as e:
             log(f"FEHLER: {e}")
             return 2
@@ -756,8 +900,10 @@ def main(argv=None):
     if getattr(args, "year", None) and (args.from_ or args.to):
         parser.error("--year nicht zusammen mit --from/--to verwenden")
 
+    notifier = None
     try:
         cfg = Config(args.config)
+        notifier = Notifier(cfg, enabled=not args.no_notify and args.cmd == "run")
         state = State(cfg.resolve(cfg.get("output", "state_file", "state.json")))
         tesla = Tesla(cfg, state)
         if args.cmd == "login":
@@ -768,9 +914,11 @@ def main(argv=None):
             return 0
         if args.cmd == "list":
             return cmd_list(cfg, state, tesla, args)
-        return cmd_run(cfg, state, tesla, args)
+        return cmd_run(cfg, state, tesla, args, notifier)
     except Fail as e:
         log(f"FEHLER: {e}")
+        if notifier and not getattr(args, "dry_run", False):
+            notifier.send("error", "Tesla-Rechnungen: Fehler", str(e)[:900], important=True)
         return 2
     except KeyboardInterrupt:
         return 130

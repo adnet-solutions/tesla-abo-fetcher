@@ -17,7 +17,19 @@ class H(BaseHTTPRequestHandler):
         b = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code); self.send_header("Content-Type", ct); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        if self.path == "/pushover":
+            f = dict(urllib.parse.parse_qsl(raw.decode()))
+            LOG.append(("pushover", f["title"], f["message"], f["priority"]))
+            return self._send(200, {"status": 1} if f["token"] == "pt" else {"status": 0, "errors": ["token invalid"]})
+        body = json.loads(raw)
+        if self.path.startswith("/api/services/notify/"):
+            assert self.headers["Authorization"] == "Bearer hatoken"
+            LOG.append(("ha", self.path.rsplit("/", 1)[1], body["title"], body["message"], body.get("data")))
+            return self._send(200, [])
+        if self.path.startswith("/api/webhook/"):
+            LOG.append(("ha_webhook", self.path.rsplit("/", 1)[1], body["title"], body["important"]))
+            return self._send(200, b"", "text/plain")
         if self.path == "/oauth2/v3/token":
             assert body["client_id"] == "ownerapi"
             if body["grant_type"] == "refresh_token" and body["refresh_token"] == "bad":
@@ -33,6 +45,11 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {"documentUid": f"doc-{len(LOG)}"})
         self._send(404, {})
     def do_GET(self):
+        if self.path.startswith("/whatsapp.php"):
+            q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query))
+            LOG.append(("whatsapp", q["phone"], q["text"]))
+            ok = q["apikey"] == "wa"
+            return self._send(200, b"<p>Message queued</p>" if ok else b"<p>APIKey is invalid</p>", "text/html")
         if self.path.startswith("/repos/"):
             path = urllib.parse.unquote(self.path.split("/contents/", 1)[1].split("?")[0])
             LOG.append(("github", path))

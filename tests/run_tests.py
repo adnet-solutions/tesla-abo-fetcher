@@ -84,3 +84,50 @@ rc, o = cli("--version"); assert newer in o                 # kaputtes Update ni
 mock_server.REMOTE_FILES.clear()
 rc, o = cli("--check-update"); assert rc == 2 and "nicht gefunden" in o
 print("UPDATE-TESTS OK")
+
+# ---------------- Benachrichtigungen ----------------
+base = f"http://127.0.0.1:{http_port}"
+ncfg = cfg.replace("channels =\n", "channels = ha, pushover, whatsapp\n", 1)
+ncfg = ncfg.replace("\ntoken =\n", "\ntoken = hatoken\n", 1)
+ncfg = ncfg.replace("url = http://homeassistant.local:8123", f"url = {base}")
+ncfg = ncfg.replace("user_key =\napp_token =", f"user_key = uk\napp_token = pt\napi_url = {base}/pushover")
+ncfg = ncfg.replace("phone = +49\napikey =", f"phone = +4917000000\napikey = wa\napi_url = {base}/whatsapp.php")
+nw = Path(tempfile.mkdtemp(prefix="tpi-notify-"))
+(nw / "config.ini").write_text(ncfg)
+def runn(*a):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = T.main(["-c", str(nw / "config.ini"), *a])
+    print(f"$ {' '.join(a)}  -> rc={rc}\n{out.getvalue()}"); return rc, out.getvalue()
+def evs(kind): return [x for x in L if x[0] == kind]
+
+before = len(L)
+rc, o = runn("--notify-test"); assert rc == 0 and "3 von 3" in o
+assert evs("ha")[-1][1] == "mobile_app_iphone" and "Test" in evs("ha")[-1][2]
+assert "Testnachricht" in evs("pushover")[-1][2] and evs("whatsapp")[-1][2].startswith("*Tesla-Rechnungen: Test*")
+
+rc, _ = runn("set-token", "RT0")
+n_ha = len(evs("ha"))
+rc, o = runn("run", "--dry-run"); assert len(evs("ha")) == n_ha                   # dry-run: still
+rc, o = runn("run", "--month", "2026-09"); assert rc == 0
+assert len(evs("ha")) == n_ha + 1 and evs("ha")[-1][2] == "Tesla: 1 neue Rechnung", evs("ha")[-1]
+assert "14.09.2026: 9,99 EUR -> lokal, GMI" in evs("ha")[-1][3] and evs("pushover")[-1][3] == "0"
+rc, o = runn("run", "--month", "2026-09"); assert len(evs("ha")) == n_ha + 1      # nichts Neues -> keine Meldung
+rc, o = runn("run", "--month", "2026-08", "--no-notify"); assert len(evs("ha")) == n_ha + 1
+
+# Fehlerfall: Login kaputt -> wichtige Meldung
+st = json.loads((nw / "state.json").read_text()); st["tokens"] = {"refresh_token": "bad"}; (nw / "state.json").write_text(json.dumps(st))
+rc, o = runn("run"); assert rc == 2
+assert "neu anmelden" in evs("ha")[-1][3] and evs("ha")[-1][4] == {"push": {"interruption-level": "time-sensitive"}}
+assert evs("pushover")[-1][3] == "1" and "neu anmelden" in evs("whatsapp")[-1][2]
+
+# Kanal kaputt darf den Rest nicht stören
+(nw / "config.ini").write_text(ncfg.replace("apikey = wa", "apikey = falsch").replace("app_token = pt", "app_token = falsch"))
+rc, o = runn("--notify-test"); assert rc == 1 and "1 von 3" in o and "CallMeBot lehnt ab" in o and "Pushover meldet" in o
+
+# Webhook-Variante + Update-Meldung
+(nw / "config.ini").write_text(ncfg.replace("channels = ha, pushover, whatsapp", "channels = ha").replace("webhook_id =", "webhook_id = tesla_hook").replace("hatoken", ""))
+os.environ["TPI_GITHUB_API"] = base  # Mock statt echtes GitHub
+mock_server.REMOTE_FILES["tesla_pc_invoices.py"] = b'VERSION = "99.0.0"\n'
+rc, o = runn("--check-update"); assert rc == 3 and evs("ha_webhook")[-1][1:3] == ("tesla_hook", "Tesla-Rechnungen: Update 99.0.0")
+print("NOTIFY-TESTS OK")

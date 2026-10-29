@@ -78,7 +78,68 @@ Cron (`crontab -e`), täglich um 7:12 – kostet nichts, wenn nichts Neues da is
 
 ```
 12 7 * * * cd /opt/tesla-abo-fetcher && /usr/bin/python3 tesla_pc_invoices.py run >> run.log 2>&1
+47 8 * * 1 cd /opt/tesla-abo-fetcher && /usr/bin/python3 tesla_pc_invoices.py --check-update >> run.log 2>&1
 ```
+
+Die zweite Zeile schaut jeden Montag nach Updates und meldet sich (siehe Benachrichtigungen) nur,
+wenn es eins gibt. Empfohlen ist der Betrieb auf einem separaten Linux-Rechner/Container statt
+in Home Assistant: Der Tesla-Token landet so nicht in den HA-Backups, und `--update` kann
+`git pull` nutzen. **Wichtig:** Nur an einer Stelle laufen lassen – Tesla tauscht den
+Refresh-Token bei jeder Nutzung aus, zwei Installationen mit derselben `state.json` werfen sich
+gegenseitig raus.
+
+## Benachrichtigungen
+
+Aufs Handy über **Home Assistant**, **Pushover** und/oder **WhatsApp** – in `config.ini`:
+
+```ini
+[notify]
+channels = ha, pushover     ; beliebig kombinierbar, leer = aus
+events = new, error, update
+```
+
+| Ereignis | Wann | Beispiel |
+|---|---|---|
+| `new` | neue Rechnungen verarbeitet | „Tesla: 1 neue Rechnung – 14.09.2026: 9,99 EUR -> lokal, GMI" |
+| `error` | Fehler, z. B. Tesla-Login abgelaufen (wird als wichtig/durchstellend gesendet) | „Tesla-Login abgelaufen … bitte neu anmelden" |
+| `update` | `--check-update` findet eine neue Version | „Update 1.3.0 – Installieren mit --update" |
+
+Keine Meldung bei Läufen ohne neue Rechnungen, bei `--dry-run`, `--mark-only` und `--no-notify`.
+Fällt ein Kanal aus, gehen die anderen trotzdem raus, und der Lauf selbst läuft weiter.
+
+Testen: `python3 tesla_pc_invoices.py --notify-test`
+
+**Home Assistant – direkt aufs iPhone** (empfohlen): In HA unter Profil > Sicherheit einen
+langlebigen Zugangs-Token erstellen, in `[notify_ha]` die HA-Adresse, den Token und den
+Notify-Dienst der Companion-App eintragen (`notify.mobile_app_…`, zu finden unter
+Entwicklerwerkzeuge > Aktionen). Fehler kommen als „zeitkritisch" und gehen damit auch durch
+den Fokus-Modus.
+
+**Home Assistant – per Webhook** (wenn HA selbst entscheiden soll, z. B. TTS oder Dashboard):
+`webhook_id` setzen, Token/Service leer lassen und in HA:
+
+```yaml
+alias: Tesla-Rechnungen Meldung
+triggers:
+  - trigger: webhook
+    webhook_id: tesla_abo_fetcher        # = webhook_id in config.ini
+    allowed_methods: [POST]
+    local_only: true
+actions:
+  - action: notify.mobile_app_iphone
+    data:
+      title: "{{ trigger.json.title }}"
+      message: "{{ trigger.json.message }}"
+```
+
+**Pushover**: User Key von der Startseite pushover.net, unter „Create an Application" ein
+App-Token anlegen. Beides in `[notify_pushover]`.
+
+**WhatsApp**: Läuft über den kostenlosen Dienst CallMeBot (nur an die eigene Nummer, nur private
+Nutzung, inoffiziell – eine offizielle WhatsApp-API für Privatleute gibt es nicht). Einrichtung:
++34 623 78 95 95 als Kontakt speichern, per WhatsApp „I allow callmebot to send me messages"
+schicken, den API-Key aus der Antwort mit deiner Nummer in `[notify_whatsapp]` eintragen.
+Hinweis: Der Nachrichtentext läuft dabei über den Server von CallMeBot.
 
 ## Automatisch in Home Assistant
 
