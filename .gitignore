@@ -1,0 +1,10 @@
+# Zugangsdaten und Laufzeitdaten – niemals committen
+config.ini
+state.json
+rechnungen/
+*.pdf
+run.log
+
+__pycache__/
+*.pyc
+.tmp-*

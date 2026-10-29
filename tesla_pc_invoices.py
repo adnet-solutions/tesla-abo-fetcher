@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""
+tesla_pc_invoices.py – Tesla Premium-Connectivity-Rechnungen abholen
+und lokal ablegen und/oder an GetMyInvoices (API oder Mail) weitergeben.
+
+Nur Python-Standardbibliothek (Python >= 3.8), läuft auf jedem Linux-Server
+und im Home-Assistant-Container.
+
+Befehle:
+  login                 Einmalig bei Tesla anmelden (Browser + URL einfügen)
+  set-token TOKEN       Alternativ: vorhandenen Refresh-Token übernehmen
+  list                  Verfügbare Rechnungen anzeigen (mit Status)
+  run                   Neue Rechnungen verarbeiten (Standard)
+
+Wichtige Optionen für list/run:
+  --month 2026-09       nur dieser Monat
+  --year 2026           nur dieses Jahr
+  --from 2026-01 --to 2026-06   Zeitraum (Monate inklusive)
+  --reload              auch bereits erledigte Rechnungen erneut verarbeiten
+  --local / --no-local  lokale Ablage an/aus (überschreibt config.ini)
+  --gmi api|mail|none   Weitergabe an GMI (überschreibt config.ini)
+  --mark-only           nichts senden, nur als erledigt markieren
+  --dry-run             nur anzeigen, was passieren würde
+"""
+
+import argparse
+import base64
+import configparser
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import secrets
+import smtplib
+import ssl
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+from pathlib import Path
+
+VERSION = "1.0.0"
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+OWNERAPI_CLIENT_ID = "ownerapi"
+OWNERAPI_REDIRECT_URI = "https://auth.tesla.com/void/callback"
+OWNERAPI_SCOPES = "openid email offline_access"
+PC_OPTION_CODE = "$CPF1"  # Premium Connectivity
+
+GMI_DEFAULT_BASE = "https://api.getmyinvoices.com/accounts/v3"
+
+
+# --------------------------------------------------------------------------
+# Hilfsfunktionen
+# --------------------------------------------------------------------------
+
+class Fail(Exception):
+    """Fehler mit verständlicher Meldung für den Nutzer."""
+
+
+DEBUG = False
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def debug(msg):
+    if DEBUG:
+        print(f"[debug] {msg}", flush=True)
+
+
+def http(method, url, *, headers=None, json_body=None, form=None, expect="json", timeout=60):
+    data = None
+    hdrs = {"Accept": "application/json" if expect == "json" else "*/*"}
+    hdrs.update(headers or {})
+    if json_body is not None:
+        data = json.dumps(json_body).encode()
+        hdrs["Content-Type"] = "application/json"
+    elif form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    debug(f"{method} {url.split('?')[0]}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        raise HttpError(e.code, body.decode("utf-8", "replace")[:500], url) from None
+    except urllib.error.URLError as e:
+        raise Fail(f"Verbindung zu {urllib.parse.urlsplit(url).netloc} fehlgeschlagen: {e.reason}") from None
+    debug(f"-> {status}, {len(body)} Bytes")
+    if expect == "json":
+        try:
+            return json.loads(body.decode("utf-8") or "null")
+        except ValueError:
+            raise Fail(f"Unerwartete Antwort (kein JSON) von {url.split('?')[0]}: {body[:200]!r}") from None
+    return body
+
+
+class HttpError(Fail):
+    def __init__(self, code, body, url):
+        self.code = code
+        self.body = body
+        super().__init__(f"HTTP {code} von {url.split('?')[0]}: {body}")
+
+
+def parse_date(value):
+    """Versucht, ein Rechnungsdatum robust in ein date zu wandeln."""
+    if not value:
+        return None
+    s = str(value).strip()
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return dt.date(int(m[1]), int(m[2]), int(m[3]))
+    for fmt in ("%m/%d/%Y", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return dt.datetime.strptime(s[:10], fmt).date()
+        except ValueError:
+            pass
+    if s.isdigit():  # Unix-Zeitstempel (s oder ms)
+        n = int(s)
+        if n > 10**11:
+            n //= 1000
+        return dt.datetime.utcfromtimestamp(n).date()
+    return None
+
+
+def parse_month(value, arg):
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})", value or "")
+    if not m or not 1 <= int(m[2]) <= 12:
+        raise Fail(f"{arg} erwartet JJJJ-MM, z. B. 2026-09 (bekommen: {value!r})")
+    return int(m[1]), int(m[2])
+
+
+def atomic_write(path, data: bytes, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+# --------------------------------------------------------------------------
+# Konfiguration und Status
+# --------------------------------------------------------------------------
+
+class Config:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+        if not self.path.exists():
+            raise Fail(f"Konfiguration nicht gefunden: {self.path}\n"
+                       f"Kopiere config.example.ini nach config.ini und trage deine Daten ein.")
+        self.cp.read(self.path, encoding="utf-8")
+
+    def get(self, section, key, default=""):
+        return self.cp.get(section, key, fallback=default).strip()
+
+    def bool(self, section, key, default=False):
+        return self.cp.getboolean(section, key, fallback=default)
+
+    def resolve(self, p):
+        p = Path(os.path.expanduser(p))
+        return p if p.is_absolute() else (self.path.parent / p)
+
+
+class State:
+    """state.json: Tokens + welche Rechnung schon wohin geliefert wurde."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = {"tokens": {}, "invoices": {}}
+        if self.path.exists():
+            self.data.update(json.loads(self.path.read_text(encoding="utf-8")))
+
+    def save(self):
+        atomic_write(self.path, json.dumps(self.data, indent=2, ensure_ascii=False).encode())
+
+    @property
+    def tokens(self):
+        return self.data.setdefault("tokens", {})
+
+    def inv(self, inv_id):
+        return self.data.setdefault("invoices", {}).setdefault(inv_id, {})
+
+    def done(self, inv_id, target):
+        return target in self.data.get("invoices", {}).get(inv_id, {})
+
+    def mark(self, inv_id, target, **extra):
+        rec = self.inv(inv_id)
+        rec[target] = dt.datetime.now().isoformat(timespec="seconds")
+        rec.update({k: v for k, v in extra.items() if v})
+
+
+# --------------------------------------------------------------------------
+# Tesla
+# --------------------------------------------------------------------------
+
+class Tesla:
+    def __init__(self, cfg: Config, state: State):
+        self.cfg = cfg
+        self.state = state
+        self.auth_base = cfg.get("tesla", "auth_base", "https://auth.tesla.com").rstrip("/")
+        self.own_base = cfg.get("tesla", "ownership_base", "https://ownership.tesla.com").rstrip("/")
+        self.vin = cfg.get("tesla", "vin").upper()
+        self.country = cfg.get("tesla", "country", "DE")
+        self.language = cfg.get("tesla", "language", "de")
+        self.locale = cfg.get("tesla", "locale", "de_DE")
+        self.user_agent = cfg.get("tesla", "user_agent", f"tesla-pc-invoices/{VERSION}")
+
+    # --- Login -------------------------------------------------------------
+
+    def login_interactive(self):
+        verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        st = secrets.token_urlsafe(16)
+        params = {
+            "client_id": OWNERAPI_CLIENT_ID,
+            "redirect_uri": OWNERAPI_REDIRECT_URI,
+            "response_type": "code",
+            "scope": OWNERAPI_SCOPES,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": st,
+            "locale": self.locale.replace("_", "-"),
+        }
+        url = f"{self.auth_base}/oauth2/v3/authorize?{urllib.parse.urlencode(params)}"
+        log("\n1) Öffne diese Adresse im Browser und melde dich mit deinem Tesla-Konto an:\n")
+        log(url)
+        log("\n2) Nach dem Login landest du auf einer Seite 'Page Not Found' (auth.tesla.com/void/callback?...).")
+        log("   Das ist richtig so. Kopiere die KOMPLETTE Adresse aus der Adresszeile und füge sie hier ein.\n")
+        pasted = input("Adresse: ").strip()
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(pasted).query)
+        code = (q.get("code") or [None])[0]
+        if not code:
+            raise Fail("In der eingefügten Adresse steckt kein 'code='. Bitte nochmal versuchen.")
+        if (q.get("state") or [st])[0] != st:
+            raise Fail("State passt nicht – bitte den Login mit einer frischen Adresse wiederholen.")
+        tok = http("POST", f"{self.auth_base}/oauth2/v3/token", json_body={
+            "grant_type": "authorization_code",
+            "client_id": OWNERAPI_CLIENT_ID,
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": OWNERAPI_REDIRECT_URI,
+        })
+        self._store(tok)
+        log("\nLogin erfolgreich, Token gespeichert.")
+
+    def set_refresh_token(self, token):
+        self.state.tokens.clear()
+        self.state.tokens["refresh_token"] = token.strip()
+        self.state.save()
+        self.access_token()  # sofort prüfen + rotieren
+        log("Refresh-Token übernommen und geprüft.")
+
+    def _store(self, tok):
+        if "access_token" not in tok:
+            raise Fail(f"Tesla hat keinen Token geliefert: {tok}")
+        t = self.state.tokens
+        t["access_token"] = tok["access_token"]
+        if tok.get("refresh_token"):  # Tesla rotiert den Refresh-Token
+            t["refresh_token"] = tok["refresh_token"]
+        t["expires_at"] = int(dt.datetime.now().timestamp()) + int(tok.get("expires_in", 28800)) - 300
+        self.state.save()
+
+    def access_token(self):
+        t = self.state.tokens
+        if t.get("access_token") and t.get("expires_at", 0) > dt.datetime.now().timestamp():
+            return t["access_token"]
+        if not t.get("refresh_token"):
+            raise Fail("Noch kein Tesla-Login vorhanden. Bitte zuerst: tesla_pc_invoices.py login")
+        try:
+            tok = http("POST", f"{self.auth_base}/oauth2/v3/token", json_body={
+                "grant_type": "refresh_token",
+                "client_id": OWNERAPI_CLIENT_ID,
+                "refresh_token": t["refresh_token"],
+                "scope": OWNERAPI_SCOPES,
+            })
+        except HttpError as e:
+            if e.code in (400, 401, 403):
+                raise Fail("Tesla-Login abgelaufen oder ungültig. Bitte neu anmelden: tesla_pc_invoices.py login") from None
+            raise
+        self._store(tok)
+        return t["access_token"]
+
+    # --- Rechnungen ----------------------------------------------------------
+
+    def _get(self, path, params, expect="json"):
+        if not self.vin:
+            raise Fail("In config.ini fehlt [tesla] vin = ...")
+        q = {"deviceLanguage": self.language, "deviceCountry": self.country,
+             "httpLocale": self.locale, "vin": self.vin, **params}
+        url = f"{self.own_base}{path}?{urllib.parse.urlencode(q)}"
+        hdrs = {"Authorization": f"Bearer {self.access_token()}", "User-Agent": self.user_agent}
+        try:
+            return http("GET", url, headers=hdrs, expect=expect)
+        except HttpError as e:
+            if e.code == 401:  # Token evtl. serverseitig ungültig -> einmal erneuern
+                self.state.tokens.pop("access_token", None)
+                hdrs["Authorization"] = f"Bearer {self.access_token()}"
+                return http("GET", url, headers=hdrs, expect=expect)
+            raise
+
+    def invoices(self):
+        raw = self._get("/mobile-app/subscriptions/invoices", {"optionCode": PC_OPTION_CODE})
+        debug("Rohantwort Rechnungsliste:\n" + json.dumps(raw, indent=2, ensure_ascii=False)[:4000])
+        items = raw
+        if isinstance(raw, dict):
+            for key in ("data", "invoices", "Invoices", "response", "results"):
+                if isinstance(raw.get(key), list):
+                    items = raw[key]
+                    break
+                if isinstance(raw.get(key), dict):
+                    inner = raw[key]
+                    for k2 in ("invoices", "Invoices", "data"):
+                        if isinstance(inner.get(k2), list):
+                            items = inner[k2]
+                            break
+        if not isinstance(items, list):
+            raise Fail("Rechnungsliste hat ein unbekanntes Format. Mit --debug starten und die Ausgabe prüfen.")
+
+        out = []
+        for it in items:
+            g = lambda *keys: next((it[k] for k in keys if it.get(k) not in (None, "")), None)
+            inv_id = g("InvoiceId", "invoiceId", "id", "Id", "uuid", "contentId")
+            if not inv_id:
+                debug(f"Eintrag ohne ID übersprungen: {it}")
+                continue
+            date_raw = g("InvoiceDate", "invoiceDate", "date", "BillingDate", "billingDate", "createdAt")
+            out.append({
+                "id": str(inv_id),
+                "date": parse_date(date_raw),
+                "date_raw": date_raw,
+                "file_name": g("InvoiceFileName", "invoiceFileName", "fileName"),
+                "amount": g("Amount", "amount", "TotalAmount", "totalAmount", "Total", "total"),
+                "currency": g("Currency", "currency", "CurrencyCode", "currencyCode") or "EUR",
+                "number": g("InvoiceNumber", "invoiceNumber", "DocumentNumber"),
+            })
+        out.sort(key=lambda x: (x["date"] or dt.date.min, x["id"]))
+        return out
+
+    def download(self, inv_id):
+        pdf = self._get(f"/mobile-app/documents/invoices/{urllib.parse.quote(inv_id)}", {}, expect="bytes")
+        if not pdf.startswith(b"%PDF"):
+            raise Fail(f"Rechnung {inv_id}: Antwort ist kein PDF ({pdf[:120]!r})")
+        return pdf
+
+
+# --------------------------------------------------------------------------
+# Ziele: lokal, GMI-API, GMI-Mail
+# --------------------------------------------------------------------------
+
+def file_name_for(cfg, inv):
+    pattern = cfg.get("output", "filename", "Tesla_PremiumConnectivity_{date}_{id}.pdf")
+    d = inv["date"]
+    name = pattern.format(
+        date=d.isoformat() if d else "unbekannt",
+        year=d.year if d else "0000", month=f"{d.month:02d}" if d else "00",
+        id=inv["id"][:8], id_full=inv["id"], number=inv["number"] or inv["id"][:8],
+    )
+    return re.sub(r"[^\w.\-]+", "_", name)
+
+
+def save_local(cfg, inv, pdf):
+    directory = cfg.resolve(cfg.get("output", "directory", "rechnungen"))
+    if cfg.bool("output", "year_subfolders", True) and inv["date"]:
+        directory = directory / str(inv["date"].year)
+    path = directory / file_name_for(cfg, inv)
+    atomic_write(path, pdf, mode=0o644)
+    return path
+
+
+def send_gmi_api(cfg, inv, pdf, fname):
+    key = cfg.get("gmi", "api_key")
+    if not key:
+        raise Fail("GMI per API gewählt, aber [gmi] api_key fehlt.")
+    base = cfg.get("gmi", "api_base", GMI_DEFAULT_BASE).rstrip("/")
+    body = {
+        "fileName": fname,
+        "fileContent": base64.b64encode(pdf).decode(),
+        "documentType": cfg.get("gmi", "document_type", "INCOMING_INVOICE"),
+        "runOCR": cfg.bool("gmi", "run_ocr", True),
+    }
+    if inv["date"]:
+        body["documentDate"] = inv["date"].isoformat()
+    if inv["number"]:
+        body["documentNumber"] = str(inv["number"])
+    tags = [t.strip() for t in cfg.get("gmi", "tags", "Tesla, Premium Connectivity").split(",") if t.strip()]
+    if tags:
+        body["tags"] = tags
+    if cfg.get("gmi", "company_id"):
+        body["companyId"] = int(cfg.get("gmi", "company_id"))
+    if cfg.get("gmi", "payment_status"):
+        body["paymentStatus"] = cfg.get("gmi", "payment_status")
+    note = cfg.get("gmi", "note", "Automatisch importiert: Tesla Premium Connectivity")
+    if note:
+        body["note"] = note
+    headers = {"X-API-KEY": key, "User-Agent": cfg.get("gmi", "user_agent", f"tesla-pc-invoices/{VERSION}")}
+    res = http("POST", f"{base}/documents", headers=headers, json_body=body)
+    debug(f"GMI-Antwort: {res}")
+    if isinstance(res, dict) and (res.get("error") or res.get("errors")):
+        raise Fail(f"GMI hat abgelehnt: {res}")
+    return (res or {}).get("documentUid") if isinstance(res, dict) else None
+
+
+def send_mail(cfg, inv, pdf, fname):
+    to = cfg.get("mail", "to")
+    host = cfg.get("mail", "smtp_host")
+    if not to or not host:
+        raise Fail("GMI per Mail gewählt, aber [mail] to oder smtp_host fehlt.")
+    sender = cfg.get("mail", "from") or cfg.get("mail", "smtp_user")
+    d = inv["date"].strftime("%d.%m.%Y") if inv["date"] else "?"
+    msg = EmailMessage()
+    msg["Subject"] = cfg.get("mail", "subject", "Tesla Premium Connectivity Rechnung {date}").format(
+        date=d, id=inv["id"][:8])
+    msg["From"] = sender
+    msg["To"] = to
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=(sender.split("@")[-1] if "@" in sender else None))
+    amount = f"{inv['amount']} {inv['currency']}" if inv["amount"] else "siehe PDF"
+    msg.set_content(f"Tesla Premium Connectivity\nRechnungsdatum: {d}\nBetrag: {amount}\n"
+                    f"VIN: {cfg.get('tesla', 'vin')}\n\nAutomatisch versendet von tesla_pc_invoices.py")
+    msg.add_attachment(pdf, maintype="application", subtype="pdf", filename=fname)
+
+    port = int(cfg.get("mail", "smtp_port", "587"))
+    security = cfg.get("mail", "smtp_security", "starttls").lower()
+    user, pw = cfg.get("mail", "smtp_user"), cfg.get("mail", "smtp_password")
+    ctx = ssl.create_default_context()
+    if security == "ssl":
+        smtp = smtplib.SMTP_SSL(host, port, context=ctx, timeout=60)
+    else:
+        smtp = smtplib.SMTP(host, port, timeout=60)
+    with smtp:
+        if security == "starttls":
+            smtp.starttls(context=ctx)
+        if user:
+            smtp.login(user, pw)
+        smtp.send_message(msg)
+
+
+# --------------------------------------------------------------------------
+# Ablauf
+# --------------------------------------------------------------------------
+
+def filter_invoices(invs, args):
+    def in_range(d):
+        if args.month:
+            y, m = parse_month(args.month, "--month")
+            return d is not None and (d.year, d.month) == (y, m)
+        if args.year:
+            return d is not None and d.year == int(args.year)
+        lo = parse_month(args.from_, "--from") if args.from_ else None
+        hi = parse_month(args.to, "--to") if args.to else None
+        if (lo or hi) and d is None:
+            return False
+        if lo and (d.year, d.month) < lo:
+            return False
+        if hi and (d.year, d.month) > hi:
+            return False
+        return True
+    return [i for i in invs if in_range(i["date"])]
+
+
+def active_targets(cfg, args):
+    local = cfg.bool("output", "local", True) if args.local is None else args.local
+    gmi = (args.gmi or cfg.get("output", "gmi", "none")).lower()
+    if gmi not in ("api", "mail", "none"):
+        raise Fail(f"Ungültiger Wert für gmi: {gmi!r} (erlaubt: api, mail, none)")
+    targets = []
+    if local:
+        targets.append("local")
+    if gmi == "api":
+        targets.append("gmi_api")
+    elif gmi == "mail":
+        targets.append("gmi_mail")
+    if not targets:
+        raise Fail("Kein Ziel aktiv: weder lokale Ablage noch GMI. Nichts zu tun.")
+    return targets
+
+
+def cmd_list(cfg, state, tesla, args):
+    invs = filter_invoices(tesla.invoices(), args)
+    if not invs:
+        log("Keine Rechnungen im gewählten Zeitraum gefunden.")
+        return 0
+    log(f"{'Datum':<11} {'Betrag':>10}  {'ID':<10} Status")
+    for i in invs:
+        rec = state.data.get("invoices", {}).get(i["id"], {})
+        status = ", ".join(t for t in ("local", "gmi_api", "gmi_mail") if t in rec) or "neu"
+        amt = f"{i['amount']} {i['currency']}" if i["amount"] else "-"
+        log(f"{(i['date'] or '?')!s:<11} {amt:>10}  {i['id'][:8]:<10} {status}")
+    log(f"\n{len(invs)} Rechnung(en).")
+    return 0
+
+
+def cmd_run(cfg, state, tesla, args):
+    targets = active_targets(cfg, args)
+    invs = filter_invoices(tesla.invoices(), args)
+    log(f"{len(invs)} Rechnung(en) im Zeitraum, Ziele: {', '.join(targets)}"
+        f"{' (reload)' if args.reload else ''}{' (dry-run)' if args.dry_run else ''}")
+
+    errors = 0
+    processed = 0
+    for inv in invs:
+        todo = [t for t in targets if args.reload or not state.done(inv["id"], t)]
+        if not todo:
+            continue
+        label = f"{inv['date'] or '?'} ({inv['id'][:8]})"
+        if args.dry_run:
+            log(f"  würde verarbeiten: {label} -> {', '.join(todo)}")
+            continue
+        if args.mark_only:
+            for t in todo:
+                state.mark(inv["id"], t, date=str(inv["date"] or ""))
+            state.save()
+            log(f"  markiert: {label} -> {', '.join(todo)}")
+            continue
+        try:
+            pdf = tesla.download(inv["id"])
+            fname = file_name_for(cfg, inv)
+            for t in todo:
+                if t == "local":
+                    path = save_local(cfg, inv, pdf)
+                    state.mark(inv["id"], t, date=str(inv["date"] or ""), file=str(path))
+                    log(f"  gespeichert: {label} -> {path}")
+                elif t == "gmi_api":
+                    uid = send_gmi_api(cfg, inv, pdf, fname)
+                    state.mark(inv["id"], t, date=str(inv["date"] or ""), gmi_uid=uid)
+                    log(f"  an GMI (API): {label}{f' -> {uid}' if uid else ''}")
+                elif t == "gmi_mail":
+                    send_mail(cfg, inv, pdf, fname)
+                    state.mark(inv["id"], t, date=str(inv["date"] or ""))
+                    log(f"  an GMI (Mail): {label}")
+                state.save()  # nach jedem Ziel sichern, damit nichts doppelt geht
+            processed += 1
+        except (Fail, smtplib.SMTPException, OSError) as e:
+            errors += 1
+            log(f"  FEHLER bei {label}: {e}")
+
+    if not args.dry_run:
+        log(f"Fertig: {processed} verarbeitet, {errors} Fehler.")
+    return 1 if errors else 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Tesla Premium-Connectivity-Rechnungen abholen und an GetMyInvoices weitergeben.")
+    p.add_argument("-c", "--config", default=str(SCRIPT_DIR / "config.ini"), help="Pfad zur config.ini")
+    p.add_argument("--debug", action="store_true", help="ausführliche Ausgabe")
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("login", help="einmalig bei Tesla anmelden")
+    st = sub.add_parser("set-token", help="vorhandenen Tesla-Refresh-Token übernehmen")
+    st.add_argument("token")
+
+    def add_filters(sp):
+        g = sp.add_argument_group("Zeitraum")
+        g.add_argument("--month", metavar="JJJJ-MM", help="nur dieser Monat, z. B. 2026-09")
+        g.add_argument("--year", type=int, metavar="JJJJ", help="nur dieses Jahr, z. B. 2026")
+        g.add_argument("--from", dest="from_", metavar="JJJJ-MM", help="ab Monat JJJJ-MM (inklusive)")
+        g.add_argument("--to", metavar="JJJJ-MM", help="bis Monat JJJJ-MM (inklusive)")
+
+    ls = sub.add_parser("list", help="Rechnungen anzeigen")
+    add_filters(ls)
+
+    rn = sub.add_parser("run", help="neue Rechnungen verarbeiten (Standard)")
+    add_filters(rn)
+    rn.add_argument("--reload", "--all", dest="reload", action="store_true",
+                    help="auch bereits erledigte Rechnungen erneut verarbeiten")
+    lg = rn.add_mutually_exclusive_group()
+    lg.add_argument("--local", dest="local", action="store_true", default=None, help="lokal speichern")
+    lg.add_argument("--no-local", dest="local", action="store_false", help="nicht lokal speichern")
+    rn.add_argument("--gmi", choices=["api", "mail", "none"], help="Weitergabe an GMI")
+    rn.add_argument("--mark-only", action="store_true",
+                    help="nichts herunterladen/senden, nur als erledigt markieren")
+    rn.add_argument("--dry-run", action="store_true", help="nur anzeigen, nichts tun")
+    return p
+
+
+def main(argv=None):
+    global DEBUG
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    DEBUG = args.debug
+    if not args.cmd:
+        args = parser.parse_args((argv or sys.argv[1:]) + ["run"])
+        DEBUG = args.debug
+    if getattr(args, "month", None) and (args.year or args.from_ or args.to):
+        parser.error("--month nicht zusammen mit --year/--from/--to verwenden")
+    if getattr(args, "year", None) and (args.from_ or args.to):
+        parser.error("--year nicht zusammen mit --from/--to verwenden")
+
+    try:
+        cfg = Config(args.config)
+        state = State(cfg.resolve(cfg.get("output", "state_file", "state.json")))
+        tesla = Tesla(cfg, state)
+        if args.cmd == "login":
+            tesla.login_interactive()
+            return 0
+        if args.cmd == "set-token":
+            tesla.set_refresh_token(args.token)
+            return 0
+        if args.cmd == "list":
+            return cmd_list(cfg, state, tesla, args)
+        return cmd_run(cfg, state, tesla, args)
+    except Fail as e:
+        log(f"FEHLER: {e}")
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
