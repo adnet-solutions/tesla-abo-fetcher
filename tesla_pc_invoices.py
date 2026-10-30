@@ -52,7 +52,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 DEFAULT_REPO = "adnet-solutions/tesla-abo-fetcher"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -474,6 +474,8 @@ def send_gmi_api(cfg, inv, pdf, fname):
         body["companyId"] = int(cfg.get("gmi", "company_id"))
     if cfg.get("gmi", "payment_status"):
         body["paymentStatus"] = cfg.get("gmi", "payment_status")
+    if cfg.get("gmi", "payment_method"):
+        body["paymentMethod"] = cfg.get("gmi", "payment_method")
     note = cfg.get("gmi", "note", "Automatisch importiert: Tesla Premium Connectivity")
     if note:
         body["note"] = note

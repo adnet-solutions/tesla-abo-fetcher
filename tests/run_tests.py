@@ -179,3 +179,5 @@ with contextlib.redirect_stdout(out):
     rc = T.main(["-c", str(tw / "config.ini"), "run", "--month", "2026-09", "--no-local"])
 assert rc == 0 and evs("gmi")[-1][4] == ["#ADNET", "#Tesla"], evs("gmi")[-1]
 print("TAG-TESTS OK")
+assert evs("gmi")[-1][5:7] == ("cc", "Paid"), evs("gmi")[-1]
+print("ZAHLUNGSART-TEST OK")

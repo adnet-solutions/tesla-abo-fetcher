@@ -4,6 +4,9 @@ Neue Versionen oben. `--check-update` und `--update` zeigen die Einträge an,
 die neuer sind als die installierte Version – Format daher beibehalten:
 `## [x.y.z] – Datum`, darunter Stichpunkte.
 
+## [1.2.3] – 2026-10-30
+- Neu: Zahlungsart für GMI einstellbar (`[gmi] payment_method`, z. B. `cc` = Kreditkarte). In die eigene `config.ini` übernehmen
+
 ## [1.2.2] – 2026-10-30
 - Fix: Werte in der `config.ini` dürfen jetzt `#` enthalten (z. B. GMI-Tags `#ADNET`); bisher wurde alles ab `#` als Kommentar ignoriert. Kommentare am Zeilenende nur noch mit `;`
 

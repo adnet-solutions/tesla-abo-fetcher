@@ -47,7 +47,7 @@ class H(BaseHTTPRequestHandler):
             assert self.headers["X-API-KEY"] == "gmikey"
             pdf = base64.b64decode(body["fileContent"])
             assert pdf.startswith(b"%PDF")
-            LOG.append(("gmi", body["fileName"], body.get("documentDate"), body["documentType"], body.get("tags")))
+            LOG.append(("gmi", body["fileName"], body.get("documentDate"), body["documentType"], body.get("tags"), body.get("paymentMethod"), body.get("paymentStatus")))
             return self._send(200, {"documentUid": f"doc-{len(LOG)}"})
         self._send(404, {})
     def do_GET(self):
