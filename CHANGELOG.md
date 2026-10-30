@@ -4,6 +4,9 @@ Neue Versionen oben. `--check-update` und `--update` zeigen die Einträge an,
 die neuer sind als die installierte Version – Format daher beibehalten:
 `## [x.y.z] – Datum`, darunter Stichpunkte.
 
+## [1.2.2] – 2026-10-30
+- Fix: Werte in der `config.ini` dürfen jetzt `#` enthalten (z. B. GMI-Tags `#ADNET`); bisher wurde alles ab `#` als Kommentar ignoriert. Kommentare am Zeilenende nur noch mit `;`
+
 ## [1.2.1] – 2026-10-30
 - Fix: Tesla-Login – Tesla akzeptiert für den App-Zugang nur noch die Rücksprungadresse `tesla://auth/callback`
   (Fehler „redirect_uri … not registered"). Den Code jetzt aus den Browser-Entwicklertools kopieren, Anleitung zeigt `login` an

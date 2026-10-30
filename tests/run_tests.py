@@ -165,3 +165,17 @@ assert rc == 0 and "Login erfolgreich" in captured["out"].getvalue()
 assert json.loads((lw / "state.json").read_text())["tokens"]["refresh_token"].startswith("RT")
 assert ("token", "authorization_code") in L
 print("LOGIN-TESTS OK")
+
+# ---------------- Tags mit # ----------------
+tw = Path(tempfile.mkdtemp(prefix="tpi-tags-"))
+(tw / "config.ini").write_text(cfg.replace("tags = Tesla, Premium Connectivity", "tags = #ADNET, #Tesla  ; Kommentar") + "\n")
+c = T.Config(tw / "config.ini")
+assert c.get("gmi", "tags") == "#ADNET, #Tesla", repr(c.get("gmi", "tags"))
+assert c.get("gmi", "api_key") == "gmikey"
+st2 = T.State(tw / "state.json"); st2.tokens["refresh_token"] = "RT0"; st2.save()
+n0 = len(evs("gmi"))
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    rc = T.main(["-c", str(tw / "config.ini"), "run", "--month", "2026-09", "--no-local"])
+assert rc == 0 and evs("gmi")[-1][4] == ["#ADNET", "#Tesla"], evs("gmi")[-1]
+print("TAG-TESTS OK")

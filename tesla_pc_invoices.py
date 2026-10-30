@@ -52,7 +52,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 DEFAULT_REPO = "adnet-solutions/tesla-abo-fetcher"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -223,7 +223,7 @@ def tls13_context():
 class Config:
     def __init__(self, path):
         self.path = Path(path)
-        self.cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+        self.cp = configparser.ConfigParser(inline_comment_prefixes=(";",), interpolation=None)  # "#" erlaubt, z. B. für GMI-Tags
         if not self.path.exists():
             raise Fail(f"Konfiguration nicht gefunden: {self.path}\n"
                        f"Kopiere config.example.ini nach config.ini und trage deine Daten ein.")
