@@ -82,6 +82,19 @@ Belege zwar meist als Duplikat, sauberer ist aber, es gezielt mit `--month` zu v
 
 Exit-Codes: `0` ok, `1` einzelne Rechnungen fehlgeschlagen, `2` Konfigurations-/Login-Fehler.
 
+### Bereits geschickte Rechnungen in GMI nachträglich anpassen
+
+Wer Tags, Zahlungsart oder Zahlungsstatus in der `config.ini` ändert, kann das mit `gmi-sync`
+auf die schon per API hochgeladenen Rechnungen übertragen (Betrag, Datum usw. bleiben unberührt):
+
+```bash
+python3 tesla_pc_invoices.py gmi-sync --dry-run          # zeigt, was geändert würde
+python3 tesla_pc_invoices.py gmi-sync --from 2026-06     # nur ab Juni 2026
+python3 tesla_pc_invoices.py gmi-sync --with-note        # Notiz auch überschreiben
+```
+
+Dafür braucht der GMI-API-Schlüssel die Berechtigung **„Nur Upload & Update"** (statt „Nur Upload").
+
 ## Automatisch auf dem Linux-Server
 
 Cron (`crontab -e`), täglich um 7:12 – kostet nichts, wenn nichts Neues da ist:

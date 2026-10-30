@@ -13,6 +13,13 @@ REMOTE_FILES = {}  # Pfad -> bytes, simuliert GitHub-Repo
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+    def do_PUT(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.headers["X-API-KEY"] == "uploadonly":
+            return self._send(403, {"error": "forbidden"})
+        uid = self.path.rsplit("/", 1)[1]
+        LOG.append(("gmi_put", uid, body))
+        return self._send(200, {"success": True})
     def _send(self, code, body, ct="application/json"):
         b = body if isinstance(body, bytes) else json.dumps(body).encode()
         self.send_response(code); self.send_header("Content-Type", ct); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)

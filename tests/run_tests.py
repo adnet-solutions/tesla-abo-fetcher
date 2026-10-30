@@ -181,3 +181,32 @@ assert rc == 0 and evs("gmi")[-1][4] == ["#ADNET", "#Tesla"], evs("gmi")[-1]
 print("TAG-TESTS OK")
 assert evs("gmi")[-1][5:7] == ("cc", "Paid"), evs("gmi")[-1]
 print("ZAHLUNGSART-TEST OK")
+
+# ---------------- gmi-sync ----------------
+sw = Path(tempfile.mkdtemp(prefix="tpi-sync-"))
+sc = cfg.replace("tags = Tesla, Premium Connectivity", "tags = #ADNET, #Tesla")
+(sw / "config.ini").write_text(sc)
+stx = T.State(sw / "state.json")
+stx.data["invoices"] = {
+    "aaa-1": {"gmi_api": "x", "date": "2026-06-07", "gmi_uid": "doc-6"},
+    "bbb-2": {"gmi_api": "x", "date": "2026-07-07", "gmi_uid": "doc-7"},
+    "ccc-3": {"gmi_api": "x", "date": "2026-05-07"},                    # ohne ID
+    "ddd-4": {"local": "x", "date": "2026-08-07"},                     # nie an GMI
+}
+stx.save()
+def runs(*a, conf=None):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = T.main(["-c", str(conf or sw / "config.ini"), *a])
+    print(f"$ {' '.join(a)} -> rc={rc}\n{out.getvalue()}"); return rc, out.getvalue()
+n0 = len(evs("gmi_put"))
+rc, o = runs("gmi-sync", "--dry-run"); assert rc == 0 and "würde aktualisieren" in o and len(evs("gmi_put")) == n0
+rc, o = runs("gmi-sync", "--from", "2026-06"); assert rc == 0
+puts = evs("gmi_put")[n0:]
+assert [p[1] for p in puts] == ["doc-6", "doc-7"], puts
+assert puts[0][2] == {"tags": ["#ADNET", "#Tesla"], "paymentStatus": "Paid", "paymentMethod": "cc"}, puts[0][2]
+rc, o = runs("gmi-sync"); assert "übersprungen: 2026-05-07" in o and "2026-08-07" not in o
+(sw / "c2.ini").write_text(sc.replace("api_key = gmikey", "api_key = uploadonly"))
+rc, o = runs("gmi-sync", conf=sw / "c2.ini"); assert rc == 1 and "Nur Upload & Update" in o and o.count("FEHLER") == 1
+assert T.gmi_uid_from({"documentUid": 5}) == "5" and T.gmi_uid_from({"data": {"document_prim_uid": 9}}) == "9" and T.gmi_uid_from("x") is None
+print("SYNC-TESTS OK")

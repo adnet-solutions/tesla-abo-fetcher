@@ -11,6 +11,8 @@ Befehle:
   set-token TOKEN       Alternativ: vorhandenen Refresh-Token übernehmen
   list                  Verfügbare Rechnungen anzeigen (mit Status)
   run                   Neue Rechnungen verarbeiten (Standard)
+  gmi-sync              Tags/Zahlungsart aus config.ini auf schon an GMI geschickte
+                        Rechnungen übertragen (API-Schlüssel "Nur Upload & Update")
 
 Wartung:
   --version             installierte Version anzeigen
@@ -52,7 +54,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 
-VERSION = "1.2.3"
+VERSION = "1.3.0"
 DEFAULT_REPO = "adnet-solutions/tesla-abo-fetcher"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -467,24 +469,99 @@ def send_gmi_api(cfg, inv, pdf, fname):
         body["documentDate"] = inv["date"].isoformat()
     if inv["number"]:
         body["documentNumber"] = str(inv["number"])
-    tags = [t.strip() for t in cfg.get("gmi", "tags", "Tesla, Premium Connectivity").split(",") if t.strip()]
-    if tags:
-        body["tags"] = tags
-    if cfg.get("gmi", "company_id"):
-        body["companyId"] = int(cfg.get("gmi", "company_id"))
-    if cfg.get("gmi", "payment_status"):
-        body["paymentStatus"] = cfg.get("gmi", "payment_status")
-    if cfg.get("gmi", "payment_method"):
-        body["paymentMethod"] = cfg.get("gmi", "payment_method")
-    note = cfg.get("gmi", "note", "Automatisch importiert: Tesla Premium Connectivity")
-    if note:
-        body["note"] = note
-    headers = {"X-API-KEY": key, "User-Agent": cfg.get("gmi", "user_agent", f"tesla-pc-invoices/{VERSION}")}
-    res = http("POST", f"{base}/documents", headers=headers, json_body=body)
+    body.update(gmi_metadata(cfg))
+    res = http("POST", f"{base}/documents", headers=gmi_headers(cfg, key), json_body=body)
     debug(f"GMI-Antwort: {res}")
     if isinstance(res, dict) and (res.get("error") or res.get("errors")):
         raise Fail(f"GMI hat abgelehnt: {res}")
-    return (res or {}).get("documentUid") if isinstance(res, dict) else None
+    return gmi_uid_from(res)
+
+
+def gmi_metadata(cfg):
+    """Felder aus [gmi], die beim Upload gesetzt und mit 'gmi-sync' nachgezogen werden."""
+    meta = {}
+    tags = [t.strip() for t in cfg.get("gmi", "tags", "Tesla, Premium Connectivity").split(",") if t.strip()]
+    if tags:
+        meta["tags"] = tags
+    if cfg.get("gmi", "company_id"):
+        meta["companyId"] = int(cfg.get("gmi", "company_id"))
+    if cfg.get("gmi", "payment_status"):
+        meta["paymentStatus"] = cfg.get("gmi", "payment_status")
+    if cfg.get("gmi", "payment_method"):
+        meta["paymentMethod"] = cfg.get("gmi", "payment_method")
+    note = cfg.get("gmi", "note", "Automatisch importiert: Tesla Premium Connectivity")
+    if note:
+        meta["note"] = note
+    return meta
+
+
+def gmi_headers(cfg, key):
+    return {"X-API-KEY": key, "User-Agent": cfg.get("gmi", "user_agent", f"tesla-abo-fetcher/{VERSION}")}
+
+
+def gmi_uid_from(res):
+    """GMI-Dokument-ID aus der Upload-Antwort (Feldname je nach API-Stand)."""
+    if not isinstance(res, dict):
+        return None
+    for src in (res, res.get("data") if isinstance(res.get("data"), dict) else {}):
+        for k in ("documentUid", "document_uid", "documentPrimUid", "document_prim_uid", "uid", "id"):
+            if src.get(k) not in (None, ""):
+                return str(src[k])
+    return None
+
+
+def update_gmi_document(cfg, uid, meta):
+    key = cfg.get("gmi", "api_key")
+    if not key:
+        raise Fail("[gmi] api_key fehlt.")
+    base = cfg.get("gmi", "api_base", GMI_DEFAULT_BASE).rstrip("/")
+    try:
+        res = http("PUT", f"{base}/documents/{urllib.parse.quote(str(uid))}",
+                   headers=gmi_headers(cfg, key), json_body=meta)
+    except HttpError as e:
+        if e.code in (401, 403):
+            raise Fail("GMI verweigert die Änderung. Der API-Schlüssel braucht die Berechtigung "
+                       "'Nur Upload & Update' (in GMI neuen Schlüssel anlegen und in config.ini eintragen).") from None
+        raise
+    debug(f"GMI-Antwort: {res}")
+    if isinstance(res, dict) and (res.get("error") or res.get("errors")):
+        raise Fail(f"GMI hat abgelehnt: {res}")
+
+
+def cmd_gmi_sync(cfg, state, args):
+    meta = gmi_metadata(cfg)
+    if not args.with_note:
+        meta.pop("note", None)
+    recs = state.data.get("invoices", {})
+    todo, missing = [], []
+    for inv_id, rec in sorted(recs.items(), key=lambda kv: kv[1].get("date", "")):
+        if "gmi_api" not in rec:
+            continue
+        d = parse_date(rec.get("date"))
+        if not filter_invoices([{"date": d}], args):
+            continue
+        (todo if rec.get("gmi_uid") else missing).append((inv_id, d, rec.get("gmi_uid")))
+    if not todo and not missing:
+        log("Keine per API an GMI geschickten Rechnungen im gewählten Zeitraum.")
+        return 0
+    log(f"Setze in GMI: {', '.join(f'{k}={v}' for k, v in meta.items())}"
+        f"{' (dry-run)' if args.dry_run else ''}")
+    errors = 0
+    for inv_id, d, uid in todo:
+        if args.dry_run:
+            log(f"  würde aktualisieren: {d or '?'} ({inv_id[:8]}) -> GMI {uid}")
+            continue
+        try:
+            update_gmi_document(cfg, uid, meta)
+            log(f"  aktualisiert: {d or '?'} ({inv_id[:8]}) -> GMI {uid}")
+        except Fail as e:
+            errors += 1
+            log(f"  FEHLER bei {d or '?'} ({inv_id[:8]}): {e}")
+            if "verweigert" in str(e):
+                break
+    for inv_id, d, _ in missing:
+        log(f"  übersprungen: {d or '?'} ({inv_id[:8]}) – keine GMI-Dokument-ID gespeichert, bitte in GMI von Hand anpassen")
+    return 1 if errors else 0
 
 
 def send_mail(cfg, inv, pdf, fname):
@@ -913,6 +990,12 @@ def build_parser():
         g.add_argument("--from", dest="from_", metavar="JJJJ-MM", help="ab Monat JJJJ-MM (inklusive)")
         g.add_argument("--to", metavar="JJJJ-MM", help="bis Monat JJJJ-MM (inklusive)")
 
+    gs = sub.add_parser("gmi-sync", help="Tags/Zahlungsart/-status aus config.ini auf bereits an GMI "
+                                           "geschickte Rechnungen übertragen")
+    add_filters(gs)
+    gs.add_argument("--with-note", action="store_true", help="auch die Notiz überschreiben")
+    gs.add_argument("--dry-run", action="store_true", help="nur anzeigen, nichts ändern")
+
     ls = sub.add_parser("list", help="Rechnungen anzeigen")
     add_filters(ls)
 
@@ -972,6 +1055,8 @@ def main(argv=None):
         if args.cmd == "set-token":
             tesla.set_refresh_token(args.token)
             return 0
+        if args.cmd == "gmi-sync":
+            return cmd_gmi_sync(cfg, state, args)
         if args.cmd == "list":
             return cmd_list(cfg, state, tesla, args)
         return cmd_run(cfg, state, tesla, args, notifier)
