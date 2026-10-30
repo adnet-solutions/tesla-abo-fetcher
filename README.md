@@ -34,9 +34,18 @@ nano config.ini            # VIN, GMI-API-Key bzw. Mail-Daten eintragen
 python3 tesla_pc_invoices.py login
 ```
 
-**Login:** Das Skript zeigt eine Tesla-Adresse. Im Browser öffnen, normal anmelden (inkl. 2FA).
-Danach landest du auf einer Seite „Page Not Found" – das ist korrekt. Die komplette Adresse
-aus der Adresszeile (`https://auth.tesla.com/void/callback?code=...`) kopieren und im Terminal einfügen.
+**Login:** Tesla leitet nach der Anmeldung auf `tesla://auth/callback?code=...` um – eine
+Adresse, die kein Browser öffnen kann. Den Code holt man sich deshalb aus den Entwicklertools
+(Chrome, Edge, Brave oder Firefox – **nicht Safari**, der versteckt die Umleitung):
+
+1. Neuen Tab öffnen, Entwicklertools auf (Mac `Cmd+Option+I`, sonst `F12`), Reiter **Network**,
+   Häkchen **Preserve log** setzen.
+2. Die Adresse, die `login` anzeigt, in diesem Tab öffnen und normal anmelden (inkl. 2FA).
+3. Danach passiert scheinbar nichts oder der Browser fragt nach einer App für `tesla://` – abbrechen.
+4. In der Netzwerk-Liste den Eintrag `tesla://auth/callback?code=…` suchen (oder den letzten
+   `authorize`-Eintrag mit Status 302 → Response Headers → `Location`), kopieren und im Terminal
+   einfügen. Der Code ist nur wenige Minuten gültig.
+
 Der Login funktioniert auch auf einem anderen Rechner: dann einfach die `state.json` mitnehmen.
 
 Alternativ einen Refresh-Token aus einer Token-App (z. B. „Auth app for Tesla") übernehmen:

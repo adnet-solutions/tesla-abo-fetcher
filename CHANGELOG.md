@@ -4,6 +4,11 @@ Neue Versionen oben. `--check-update` und `--update` zeigen die Einträge an,
 die neuer sind als die installierte Version – Format daher beibehalten:
 `## [x.y.z] – Datum`, darunter Stichpunkte.
 
+## [1.2.1] – 2026-10-30
+- Fix: Tesla-Login – Tesla akzeptiert für den App-Zugang nur noch die Rücksprungadresse `tesla://auth/callback`
+  (Fehler „redirect_uri … not registered"). Den Code jetzt aus den Browser-Entwicklertools kopieren, Anleitung zeigt `login` an
+- Token-Abruf läuft über TLS 1.3, sonst stellt Tesla Tokens aus, die der Rechnungsabruf mit 403 ablehnt
+
 ## [1.2.0] – 2026-10-29
 - Neu: Benachrichtigungen über Home Assistant (Companion-App oder Webhook), Pushover und WhatsApp (CallMeBot)
 - Meldet neue Rechnungen, Fehler (z. B. abgelaufener Tesla-Login) und verfügbare Updates

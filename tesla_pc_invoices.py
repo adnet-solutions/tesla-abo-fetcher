@@ -52,12 +52,13 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DEFAULT_REPO = "adnet-solutions/tesla-abo-fetcher"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 OWNERAPI_CLIENT_ID = "ownerapi"
-OWNERAPI_REDIRECT_URI = "https://auth.tesla.com/void/callback"
+# Seit 2026 ist für ownerapi nur noch diese Rücksprungadresse registriert.
+OWNERAPI_REDIRECT_URI = "tesla://auth/callback"
 OWNERAPI_SCOPES = "openid email offline_access"
 PC_OPTION_CODE = "$CPF1"  # Premium Connectivity
 
@@ -164,6 +165,57 @@ def atomic_write(path, data: bytes, mode=0o600):
         raise
 
 
+LOGIN_HELP = """
+Tesla-Login – so geht's (Chrome, Edge, Brave oder Firefox, NICHT Safari):
+
+1) Neuen Browser-Tab öffnen, die Entwicklertools aufmachen
+   (Mac: Cmd+Option+I, Windows/Linux: F12), Reiter "Network"/"Netzwerk" wählen
+   und das Häkchen "Preserve log"/"Log beibehalten" setzen.
+
+2) In diesem Tab folgende Adresse öffnen und mit dem Tesla-Konto anmelden:
+
+{url}
+
+3) Nach dem Login passiert scheinbar nichts, oder der Browser fragt, mit welcher
+   App er "tesla://" öffnen soll (abbrechen). Das ist richtig so.
+
+4) In der Netzwerk-Liste den Eintrag suchen, der mit "tesla://auth/callback?code="
+   beginnt (oder den letzten Eintrag "authorize" mit Status 302 anklicken und unter
+   Headers -> Response Headers den Wert von "Location" nehmen).
+   Rechtsklick -> Copy -> Copy URL bzw. den Location-Wert kopieren und hier einfügen.
+   Der Code ist nur wenige Minuten gültig.
+"""
+
+
+def extract_code(pasted, expected_state):
+    """Holt den Login-Code aus der eingefügten Adresse (oder nimmt einen nackten Code)."""
+    pasted = pasted.strip().strip('"\'')
+    if pasted.lower().startswith("location:"):
+        pasted = pasted.split(":", 1)[1].strip()
+    if "code=" not in pasted and re.fullmatch(r"[A-Za-z0-9._~\-]{20,}", pasted):
+        log("Hinweis: nur der Code eingefügt, State-Prüfung wird übersprungen.")
+        return pasted
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(pasted).query or pasted.split("?", 1)[-1])
+    if q.get("error"):
+        raise Fail(f"Tesla meldet: {q['error'][0]} {q.get('error_description', [''])[0]}".strip())
+    code = (q.get("code") or [None])[0]
+    if not code:
+        raise Fail("In der eingefügten Adresse steckt kein 'code='. Bitte 'login' nochmal starten.")
+    if (q.get("state") or [expected_state])[0] != expected_state:
+        raise Fail("State passt nicht – die Adresse stammt aus einem anderen Login-Versuch. "
+                   "Bitte 'login' neu starten und nur den neuen Link verwenden.")
+    return code
+
+
+def tls13_context():
+    ctx = ssl.create_default_context()
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    except (AttributeError, ValueError):  # sehr altes OpenSSL ohne TLS 1.3
+        debug("TLS 1.3 nicht verfügbar, nutze Standard")
+    return ctx
+
+
 # --------------------------------------------------------------------------
 # Konfiguration und Status
 # --------------------------------------------------------------------------
@@ -249,18 +301,9 @@ class Tesla:
             "locale": self.locale.replace("_", "-"),
         }
         url = f"{self.auth_base}/oauth2/v3/authorize?{urllib.parse.urlencode(params)}"
-        log("\n1) Öffne diese Adresse im Browser und melde dich mit deinem Tesla-Konto an:\n")
-        log(url)
-        log("\n2) Nach dem Login landest du auf einer Seite 'Page Not Found' (auth.tesla.com/void/callback?...).")
-        log("   Das ist richtig so. Kopiere die KOMPLETTE Adresse aus der Adresszeile und füge sie hier ein.\n")
-        pasted = input("Adresse: ").strip()
-        q = urllib.parse.parse_qs(urllib.parse.urlsplit(pasted).query)
-        code = (q.get("code") or [None])[0]
-        if not code:
-            raise Fail("In der eingefügten Adresse steckt kein 'code='. Bitte nochmal versuchen.")
-        if (q.get("state") or [st])[0] != st:
-            raise Fail("State passt nicht – bitte den Login mit einer frischen Adresse wiederholen.")
-        tok = http("POST", f"{self.auth_base}/oauth2/v3/token", json_body={
+        log(LOGIN_HELP.format(url=url))
+        code = extract_code(input("Adresse: "), st)
+        tok = self._token({
             "grant_type": "authorization_code",
             "client_id": OWNERAPI_CLIENT_ID,
             "code": code,
@@ -287,6 +330,21 @@ class Tesla:
         t["expires_at"] = int(dt.datetime.now().timestamp()) + int(tok.get("expires_in", 28800)) - 300
         self.state.save()
 
+    def _token(self, form):
+        """Token-Abruf: formularkodiert und über TLS 1.3. Über ältere TLS-Versionen
+        stellt Tesla Tokens aus, die ownership.tesla.com mit 403 ablehnt."""
+        try:
+            return http("POST", f"{self.auth_base}/oauth2/v3/token", form=form,
+                        headers={"User-Agent": self.user_agent}, ssl_context=tls13_context())
+        except HttpError as e:
+            if form["grant_type"] == "authorization_code":
+                if "redirect" in e.body.lower():
+                    raise Fail("Tesla lehnt die Rücksprungadresse ab. Bitte Skript aktualisieren (--update).") from None
+                raise Fail(f"Tesla hat den Login-Code nicht akzeptiert (HTTP {e.code}). Der Code ist nur "
+                           f"wenige Minuten gültig und nur einmal verwendbar – 'login' bitte neu starten.\n"
+                           f"Antwort: {e.body[:200]}") from None
+            raise
+
     def access_token(self):
         t = self.state.tokens
         if t.get("access_token") and t.get("expires_at", 0) > dt.datetime.now().timestamp():
@@ -294,7 +352,7 @@ class Tesla:
         if not t.get("refresh_token"):
             raise Fail("Noch kein Tesla-Login vorhanden. Bitte zuerst: tesla_pc_invoices.py login")
         try:
-            tok = http("POST", f"{self.auth_base}/oauth2/v3/token", json_body={
+            tok = self._token({
                 "grant_type": "refresh_token",
                 "client_id": OWNERAPI_CLIENT_ID,
                 "refresh_token": t["refresh_token"],

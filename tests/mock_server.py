@@ -22,7 +22,11 @@ class H(BaseHTTPRequestHandler):
             f = dict(urllib.parse.parse_qsl(raw.decode()))
             LOG.append(("pushover", f["title"], f["message"], f["priority"]))
             return self._send(200, {"status": 1} if f["token"] == "pt" else {"status": 0, "errors": ["token invalid"]})
-        body = json.loads(raw)
+        if self.path == "/oauth2/v3/token":
+            assert self.headers["Content-Type"] == "application/x-www-form-urlencoded", "Token-Abruf muss Formular sein"
+            body = dict(urllib.parse.parse_qsl(raw.decode()))
+        else:
+            body = json.loads(raw)
         if self.path.startswith("/api/services/notify/"):
             assert self.headers["Authorization"] == "Bearer hatoken"
             LOG.append(("ha", self.path.rsplit("/", 1)[1], body["title"], body["message"], body.get("data")))
@@ -32,6 +36,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, b"", "text/plain")
         if self.path == "/oauth2/v3/token":
             assert body["client_id"] == "ownerapi"
+            if body["grant_type"] == "authorization_code":
+                assert body["redirect_uri"] == "tesla://auth/callback" and body["code_verifier"]
             if body["grant_type"] == "refresh_token" and body["refresh_token"] == "bad":
                 return self._send(401, {"error": "invalid_grant"})
             TOKENS["n"] += 1

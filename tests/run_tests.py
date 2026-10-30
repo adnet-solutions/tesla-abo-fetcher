@@ -131,3 +131,37 @@ os.environ["TPI_GITHUB_API"] = base  # Mock statt echtes GitHub
 mock_server.REMOTE_FILES["tesla_pc_invoices.py"] = b'VERSION = "99.0.0"\n'
 rc, o = runn("--check-update"); assert rc == 3 and evs("ha_webhook")[-1][1:3] == ("tesla_hook", "Tesla-Rechnungen: Update 99.0.0")
 print("NOTIFY-TESTS OK")
+
+# ---------------- Login mit tesla://-Rücksprung ----------------
+import builtins, urllib.parse as up
+assert T.OWNERAPI_REDIRECT_URI == "tesla://auth/callback"
+ec = T.extract_code
+assert ec("tesla://auth/callback?code=ABC123&state=S1&issuer=https%3A%2F%2Fauth.tesla.com", "S1") == "ABC123"
+assert ec("Location: tesla://auth/callback?code=XYZ&state=S1", "S1") == "XYZ"
+assert ec('  "tesla://auth/callback?code=Q&state=S1"  ', "S1") == "Q"
+assert ec("a" * 40, "S1") == "a" * 40                                  # nackter Code
+for bad, msg in [("tesla://auth/callback?code=X&state=ANDERS", "State"),
+                 ("tesla://auth/callback?state=S1", "code="),
+                 ("tesla://auth/callback?error=login_required&error_description=nope", "login_required")]:
+    try: ec(bad, "S1"); raise AssertionError(bad)
+    except T.Fail as e: assert msg in str(e), e
+
+lw = Path(tempfile.mkdtemp(prefix="tpi-login-")); (lw / "config.ini").write_text(cfg)
+captured = {}
+def fake_input(prompt):
+    url = re.search(r"http://127\.0\.0\.1:\d+/oauth2/v3/authorize\?\S+", captured["out"].getvalue())[0]
+    q = dict(up.parse_qsl(up.urlsplit(url).query))
+    assert q["redirect_uri"] == "tesla://auth/callback" and q["client_id"] == "ownerapi" and q["code_challenge_method"] == "S256"
+    return f"tesla://auth/callback?code=LOGINCODE&state={q['state']}"
+orig = builtins.input; builtins.input = fake_input
+try:
+    captured["out"] = io.StringIO()
+    with contextlib.redirect_stdout(captured["out"]):
+        rc = T.main(["-c", str(lw / "config.ini"), "login"])
+finally:
+    builtins.input = orig
+print(captured["out"].getvalue()[-300:])
+assert rc == 0 and "Login erfolgreich" in captured["out"].getvalue()
+assert json.loads((lw / "state.json").read_text())["tokens"]["refresh_token"].startswith("RT")
+assert ("token", "authorization_code") in L
+print("LOGIN-TESTS OK")
