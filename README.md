@@ -17,6 +17,7 @@ Nur Python 3.8+ Standardbibliothek, keine Pakete nötig.
 | `tesla_pc_invoices.py` | das Skript |
 | `config.example.ini` | Vorlage für `config.ini` |
 | `CHANGELOG.md` | Änderungen je Version |
+| `LICENSE` | MIT-Lizenz |
 | `tests/run_tests.py` | End-to-End-Test gegen nachgebaute Tesla-/GMI-/SMTP-/GitHub-Server (`python3 tests/run_tests.py`) |
 
 `config.ini`, `state.json` (Tesla-Token!) und der Rechnungsordner stehen in `.gitignore`
@@ -213,3 +214,9 @@ Die Automation dazu wie oben, nur mit `result.returncode == 3` als Bedingung.
 
 `--debug` zeigt die Rohantwort von Tesla. Falls Tesla das Format ändert oder den Zugang dichtmacht
 (die Schnittstelle ist inoffiziell), sieht man dort, was zurückkommt.
+
+## Lizenz und Haftung
+
+MIT-Lizenz, siehe [LICENSE](LICENSE). Privates Hilfsskript ohne Gewähr und ohne Support.
+Kein offizielles Produkt von Tesla, GetMyInvoices, Pushover oder CallMeBot; es nutzt eine
+inoffizielle Tesla-Schnittstelle, die sich jederzeit ändern kann.
