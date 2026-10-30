@@ -205,7 +205,7 @@ rc, o = runs("gmi-sync", "--from", "2026-06"); assert rc == 0
 puts = evs("gmi_put")[n0:]
 assert [p[1] for p in puts] == ["doc-6", "doc-7"], puts
 assert puts[0][2] == {"tags": ["#ADNET", "#Tesla"], "paymentStatus": "Paid", "paymentMethod": "cc"}, puts[0][2]
-rc, o = runs("gmi-sync"); assert "übersprungen: 2026-05-07" in o and "2026-08-07" not in o
+rc, o = runs("gmi-sync"); assert "1 Rechnung(en) ohne GMI-Dokument-ID übersprungen" in o and "2026-08-07" not in o
 (sw / "c2.ini").write_text(sc.replace("api_key = gmikey", "api_key = uploadonly"))
 rc, o = runs("gmi-sync", conf=sw / "c2.ini"); assert rc == 1 and "Nur Upload & Update" in o and o.count("FEHLER") == 1
 assert T.gmi_uid_from({"documentUid": 5}) == "5" and T.gmi_uid_from({"data": {"document_prim_uid": 9}}) == "9" and T.gmi_uid_from("x") is None

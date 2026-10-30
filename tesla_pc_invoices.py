@@ -54,7 +54,7 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 DEFAULT_REPO = "adnet-solutions/tesla-abo-fetcher"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -559,8 +559,11 @@ def cmd_gmi_sync(cfg, state, args):
             log(f"  FEHLER bei {d or '?'} ({inv_id[:8]}): {e}")
             if "verweigert" in str(e):
                 break
-    for inv_id, d, _ in missing:
-        log(f"  übersprungen: {d or '?'} ({inv_id[:8]}) – keine GMI-Dokument-ID gespeichert, bitte in GMI von Hand anpassen")
+    if missing:
+        log(f"  {len(missing)} Rechnung(en) ohne GMI-Dokument-ID übersprungen "
+            f"(mit --mark-only markiert oder vor Version 1.3.0 hochgeladen – ggf. in GMI von Hand anpassen)")
+        for inv_id, d, _ in missing:
+            debug(f"    ohne ID: {d or '?'} ({inv_id[:8]})")
     return 1 if errors else 0
 
 

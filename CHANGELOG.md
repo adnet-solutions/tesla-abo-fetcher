@@ -4,6 +4,9 @@ Neue Versionen oben. `--check-update` und `--update` zeigen die Einträge an,
 die neuer sind als die installierte Version – Format daher beibehalten:
 `## [x.y.z] – Datum`, darunter Stichpunkte.
 
+## [1.3.1] – 2026-10-30
+- `gmi-sync`: Rechnungen ohne GMI-ID (z. B. per `--mark-only` markiert) nur noch als eine Sammelzeile statt einzeln melden
+
 ## [1.3.0] – 2026-10-30
 - Neu: `gmi-sync` überträgt Tags, Zahlungsart und Zahlungsstatus aus der `config.ini` nachträglich auf Rechnungen, die schon per API an GMI gingen (Zeitraum wählbar, `--dry-run`). Braucht einen GMI-API-Schlüssel mit „Nur Upload & Update"
 
